@@ -106,7 +106,7 @@ def process_hr_diagram():
     m_blue = -2.5 * np.log10(flux_blue) + zp_blue
     m_green = -2.5 * np.log10(flux_green) + zp_green
 
-    # Color
+    
     bv = m_blue - m_green
 
     #save a catalogue of each star
