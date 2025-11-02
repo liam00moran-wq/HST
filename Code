@@ -1,0 +1,150 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.io import fits
+from astropy.stats import sigma_clipped_stats
+from photutils.detection import DAOStarFinder
+from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
+from scipy.spatial import cKDTree
+import os
+import csv
+
+
+#load files, get relevant data, stack and remove cosmic rays
+def load_and_stack(folder):
+    """
+    Loads the files and relevant data, stacks the images and gets the median value for each pixel
+    """
+    files = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith('.fits')]
+    if len(files) == 0:
+        raise ValueError(f"No FITS files found in {folder}")
+
+    datas, photflams, zpts = [], [], []
+    for file in files:
+        with fits.open(file) as hdul:
+            data = hdul[1].data
+            exptime = hdul[0].header.get("EXPTIME", 1.0)
+            photflam = float(hdul[1].header.get("PHOTFLAM", 1.0))
+            zpt = float(hdul[1].header.get("PHOTZPT", 25.0))
+            datas.append(data / exptime)
+            photflams.append(photflam)
+            zpts.append(zpt)
+    
+    #Stack images with median to remove cosmic rays
+    stacked = np.median(datas, axis=0) * np.median(photflams)
+    zpt = np.median(zpts)
+    return stacked, zpt
+
+#find stars coords in the images
+def find_stars(image, threshold=1e-18, fwhm=3.0):
+    """
+    Given an image, returns the coords of the stars
+    """
+    #found this package, even calculates mag but doesnt take zp and background into account
+    daofind = DAOStarFinder(threshold=threshold, fwhm=fwhm)
+    sources = daofind(image)
+    coords = np.column_stack((sources['xcentroid'], sources['ycentroid']))
+    return coords
+
+#aperture photometry
+def measure_flux(image, coords, r_ap=5, r_in=8, r_out=12):
+    """
+    Calculates the flux of each star once given an image and the star coords
+    """
+    ap = CircularAperture(coords, r=r_ap)
+    ann = CircularAnnulus(coords, r_in=r_in, r_out=r_out)
+    phot_table = aperture_photometry(image, ap)
+
+    #background subtraction
+    bkg_medians = []
+    for mask in ann.to_mask(method='center'):
+        ann_data = mask.multiply(image)
+        ann_data_1d = ann_data[mask.data > 0]
+        _, median_sigclip, _ = sigma_clipped_stats(ann_data_1d)
+        bkg_medians.append(median_sigclip)
+    
+    bkg_medians = np.array(bkg_medians)
+    fluxes = phot_table['aperture_sum'] - bkg_medians * ap.area
+    return fluxes
+
+
+def match_stars(coords1, coords2, tolerance=2.0):
+    """
+    Keeps only the green coords that match blue coords and vice versa
+    """
+    #found this package online which allows a tolerance for matching the coords
+    tree = cKDTree(coords2)
+    matches = tree.query_ball_point(coords1, r=tolerance)
+    matched_idx1 = [i for i, m in enumerate(matches) if len(m) > 0]
+    matched_idx2 = [m[0] for m in matches if len(m) > 0]
+    return matched_idx1, matched_idx2
+
+
+def process_hr_diagram():
+    """
+    Calculates the flux of magnitude of each star and plots an HR diagram
+    """
+    #Load and stack images
+    stacked_blue, zp_blue = load_and_stack('data/F336W')
+    stacked_green, zp_green = load_and_stack('data/F555W')
+
+    #detect stars in each image
+    blue_coords = find_stars(stacked_blue)
+    green_coords = find_stars(stacked_green)
+
+    #only keep the stars that match
+    matched_blue_idx, matched_green_idx = match_stars(blue_coords, green_coords)
+    matched_blues = blue_coords[matched_blue_idx]
+    matched_greens = green_coords[matched_green_idx]
+
+    #photometry on each star in each filter
+    r_ap = 5
+    flux_blue = measure_flux(stacked_blue, matched_blues, r_ap=r_ap)
+    flux_green = measure_flux(stacked_green, matched_greens, r_ap=r_ap)
+
+    #calculate the magnitudes
+    #does produce error for some values but this is very minimal
+    m_blue = -2.5 * np.log10(flux_blue) + zp_blue
+    m_green = -2.5 * np.log10(flux_green) + zp_green
+
+    # Color
+    bv = m_blue - m_green
+
+    #save a catalogue of each star
+    #my aperture stayed the same but still included as assignment said to
+    catalog_file = "star_catalog.csv"
+    with open(catalog_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Object_ID", "X_Center", "Y_Center", "Aperture_Radius", "Magnitude_F336W", "Magnitude_F555W"])
+        for i, (x, y, mb, mg) in enumerate(zip(matched_blues[:,0], matched_blues[:,1], m_blue, m_green), start=1):
+            writer.writerow([i, round(x,3), round(y,3), r_ap, round(mb,3), round(mg,3)])
+    print(f"Catalog saved to {catalog_file}")
+
+    #HR diagram
+    plt.figure(figsize=(6,8))
+    plt.scatter(bv, m_green, s=0.5, color='black')
+    plt.gca().invert_yaxis()  #bright stars at top
+    plt.gca().invert_xaxis()  #hot stars on left
+    plt.xlabel('B-V Magnitude')
+    plt.ylabel('F555W Magnitude')
+    plt.title('Hertzsprung–Russell Diagram')
+    plt.tight_layout()
+    plt.show()
+
+    #plot against different mag
+    plt.figure(figsize=(6,8))
+    plt.scatter(bv, m_blue, s=0.5, color='black')
+    plt.gca().invert_yaxis()  #bright stars at top
+    plt.gca().invert_xaxis()  #hot stars on left
+    plt.xlabel('B-V Magnitude')
+    plt.ylabel('F336W Magnitude')
+    plt.title('Hertzsprung–Russell Diagram')
+    plt.tight_layout()
+    plt.show()
+
+    #save the figure
+    #plt.savefig("hr_diagram.png", dpi=200)
+    #print("HR diagram saved as hr_diagram.png")
+    #plt.close()
+
+if __name__ == "__main__":
+    process_hr_diagram()
